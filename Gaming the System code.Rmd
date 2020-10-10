@@ -1,0 +1,398 @@
+---
+title: "QTA project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(quanteda)
+library(pROC)
+library(topicmodels)
+library(glmnet)
+library(e1071)
+library(randomForest)
+library(xgboost)
+```
+
+```{r}
+# import data
+d = read.csv("Datasets/deceptive-opinion.csv", stringsAsFactors = FALSE)
+
+rp <- d[d$deceptive=='truthful' & d$polarity=='positive', ] # real and positive
+fp <- d[d$deceptive=='deceptive' & d$polarity=='positive', ] # fake and positive
+rn <- d[d$deceptive=='truthful' & d$polarity=='negative', ] # real and negative
+fn <- d[d$deceptive=='deceptive' & d$polarity=='negative', ] # fake and negative
+r <- d[d$deceptive=='truthful', ] # real
+f <- d[d$deceptive=='deceptive', ] # fake 
+p <- d[d$polarity=='positive', ] # positive
+n <- d[d$polarity=='negative', ] # negative
+
+# create corpus 
+corp <- corpus(d, text_field = "text")
+rp_corp <- corpus(rp$text)
+fp_corp <- corpus(fp$text)
+rn_corp <- corpus(rn$text)
+fn_corp <- corpus(fn$text)
+r_corp <- corpus(r, text_field = "text")
+f_corp <- corpus(f, text_field = "text")
+p_corp <- corpus(p, text_field = "text")
+n_corp <- corpus(n, text_field = "text")
+```
+
+```{r}
+tokens <- tokens(corp, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE, remove_symbols=TRUE)
+tokens <- tokens_remove(tokens, stopwords("english"))
+
+dfm <- dfm(tokens, tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+
+textplot_wordcloud(dfm, rotation=0, min_size=1.5, max_size=3,
+                   min_count=10, max_words=50)
+
+m <- as.matrix(dfm)
+x <- sort(colSums(m), decreasing=TRUE)
+d <- data.frame(word = names(x),freq=x)
+head(d, 10)
+library(wordcloud)
+library(RColorBrewer)
+par(bg='178')
+png(file='WordCloud.png',width=500,height=500)
+wordcloud(d$word, d$freq, max.words=300, colors=brewer.pal(8, "PRGn"), random.order=FALSE, rot.per=0.3)
+#title(main = 'Most used words in Chicago hotel reviews', font.main = 3, col.main = 'cornsilk3', cex.main = 1.5)
+
+
+```
+
+```{r}
+## Summary statistics by fake vs real and pos vs neg, fake vs real
+c <- list(rp_corp, fp_corp, rn_corp, fn_corp, r_corp, f_corp)
+
+# average no. of tokens
+for(i in c){
+  print(round(mean(ntoken(i, what = c('word'))), 2))
+}
+
+# avergage no. of types
+for(i in c){
+  print(round(mean(ntype(i, what = c('word'))), 2))
+}
+
+# avergage no. of sentances 
+for(i in c){
+  print(round(mean(nsentence(i)), 2))
+}
+
+
+# average no. of punctuation
+for(i in c){
+print(round(mean(ntoken(i) - ntoken(i, remove_punct = TRUE)), 2))
+}
+
+# lexical diversity
+for(i in c){
+tstat_lexdiv <- textstat_lexdiv(tokens(i))
+print(round(mean(tstat_lexdiv$TTR),2))
+}
+
+# readabilty score
+for(i in c){
+readability <- textstat_readability(i, measure = "Flesch.Kincaid")
+print(round(mean(readability$Flesch.Kincaid),2))
+}
+
+```
+
+```{r}
+## apply morals dictionary
+library(quanteda.dictionaries)
+data(data_dictionary_MFD)
+
+c2 <- list(r_corp, f_corp, corp)
+
+
+x <- dfm(corp, groups = "deceptive")
+x <- dfm_weight(x, scheme="prop")
+
+# apply sentiment dictionary
+moral <- dfm_lookup(x, dictionary = data_dictionary_MFD)
+m1 <- as.data.frame(as.matrix((moral[ ,'care.virtue'] - moral[ ,'care.vice'])*100))
+m2 <- as.data.frame(as.matrix((moral[ ,'fairness.virtue'] - moral[ ,'fairness.vice'])*100))
+m3 <- as.data.frame(as.matrix((moral[ ,'loyalty.virtue'] - moral[ ,'loyalty.vice'])*100))
+m4 <- as.data.frame(as.matrix((moral[ ,'authority.virtue'] - moral[ ,'authority.vice'])*100))
+m5 <- as.data.frame(as.matrix((moral[ ,'sanctity.virtue'] - moral[ ,'sanctity.vice'])*100))
+
+moral <- cbind(m1, m2, m3, m4, m5)
+colnames(moral) <- c("care", "fairness", "loyalty", "authority", "sanctity")
+moral
+
+```
+
+```{r}
+# hierachical clustering for reviews by hotel and pos vs neg
+#hotel <- aggregate(text~hotel+deceptive,d,paste,collapse="")
+#hotel$name <- paste(hotel$hotel,hotel$deceptive)
+#hotel$text[1]
+
+## hierachical clustering for reviews by hotel
+
+#pre-process data
+tokens <- tokens(corp, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                   remove_symbols=TRUE)
+tokens <- tokens_remove(tokens, stopwords("english"))
+
+h_dfm <- dfm(tokens,groups="hotel", tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+
+             
+h_dfm <- dfm_weight(h_dfm, "prop")
+diss_matrix <- textstat_dist(h_dfm, method = "euclidean")
+hclust <- hclust(diss_matrix, method= "complete")
+plot(hclust) # complete linkage 
+
+grp <- cutree(hclust, k = 4)
+table(grp)
+rownames(h_dfm)[grp == 4]
+
+# plot with border
+plot(hclust, cex=0.9) # call this line and next together
+rect.hclust(hclust, k=4, border=2:5)
+
+# plot cluster graph
+library(factoextra)
+fviz_cluster(list(data = h_dfm, cluster = grp))
+
+```
+
+```{r}
+## LDA - key topics discusses in the reviews
+
+# pre-process data
+tokens <- tokens(corp, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                   remove_symbols=TRUE)
+tokens <- tokens_remove(tokens, stopwords("english"))
+
+dfm <- dfm(tokens, tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+tdfm <- dfm_trim(dfm, min_docfreq = 2)
+
+# estimate LDA with K topics
+K = 5
+lda <- LDA(tdfm, k = K, method = "Gibbs", 
+                control = list(verbose=25L, seed = 123, burnin = 100, iter = 1000))
+terms <- get_terms(lda, 10)
+for(i in 1:K){
+  print(paste0("Topic: ", i))
+  print(terms[,i])
+}
+
+
+round(lda@gamma[1,], 2) 
+gamma <- as.data.frame(lda@gamma)
+which.min(gamma$V1)
+gamma[786,4]
+
+```
+
+```{r}
+## identify words more likely to appear in fake vs real texts - keyness analysis
+
+#pre-process data
+tokens <- tokens(corp, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                   remove_symbols=TRUE)
+#tokens <- tokens_remove(tokens, stopwords("english"))
+
+f_dfm <- dfm(tokens, groups="deceptive", tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+
+textplot_keyness(textstat_keyness(f_dfm, target="deceptive",
+                      measure="chi2"), labelsize=3)
+
+kwic(corp,"chicago", window=10)[400:500,] 
+```
+
+```{r}
+## supervised machine learning to detect fake reviews
+d$class <- ifelse(d$deceptive %in% c("deceptive"), 1, 0)
+corp <- corpus(d, text_field = "text")
+# pre-process data (keep punctuation, try different n-grams, try tfidf)
+tokens <- tokens(corp, remove_url=TRUE, remove_numbers =TRUE, remove_symbols=TRUE)
+#tokens <- tokens_remove(tokens, stopwords("english"))
+
+dfm <- dfm(tokens, tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+
+#dfm <- dfm_tfidf(dfm)
+
+set.seed(123)
+train <- sample(1:nrow(d), floor(.80 * nrow(d))) 
+test <- (1:nrow(d))[1:nrow(d) %in% train == FALSE]
+
+nb <- textmodel_nb(dfm[train,], d$deceptive[train], smooth=1) 
+
+# predicting labels for test set
+preds <- predict(nb, newdata = dfm[test,], type='class')
+# computing the confusion matrix
+(cm <- table(preds, d$deceptive[test]))
+
+probs <- nb$PcGw
+
+df <- data.frame(
+  ngram = colnames(probs),
+  prob = probs[1,],
+  stringsAsFactors=F)
+df <- df[order(df$prob),]
+
+head(df, n=20)
+tail(df, n=20)
+```
+
+```{r}
+# function to compute performance metrics
+precrecall <- function(mytable, verbose=TRUE) {
+    truePositives <- mytable[1,1]
+    falsePositives <- sum(mytable[1,]) - truePositives
+    falseNegatives <- sum(mytable[,1]) - truePositives
+    precision <- truePositives / (truePositives + falsePositives)
+    recall <- truePositives / (truePositives + falseNegatives)
+    if (verbose) {
+        print(mytable)
+        cat("\n precision =", round(precision, 2), 
+            "\n    recall =", round(recall, 2), "\n")
+    }
+    invisible(c(precision, recall))
+}
+
+
+pr <- precrecall(cm) # precision and recall
+(sum(diag(cm)) / sum(cm)) # accuracy
+2 * prod(pr) / sum(pr) #F1 score
+roc(d$deceptive[test], as.numeric(preds)) #AUC
+```
+
+```{r}
+# ridge
+ridge <- cv.glmnet(x=dfm[train,], y=d$deceptive[train],
+                   alpha=0, nfolds=5, family="binomial")
+plot(ridge)
+
+pred <- predict(ridge, dfm[test,], type="class")
+(cm <- table(pred, d$deceptive[test]))
+
+
+#lasso
+lasso <- cv.glmnet(x=dfm[train,], y=d$deceptive[train],
+                   alpha=1, nfolds=5, family="binomial")
+plot(lasso)
+
+pred <- predict(lasso, dfm[test,], type="class")
+(cm <- table(pred, d$deceptive[test]))
+
+# elastic net
+elnet <- cv.glmnet(x=dfm[train,], y=d$deceptive[train],
+                   alpha=0.5, nfolds=5, family="binomial")
+plot(elnet)
+
+pred <- predict(elnet, dfm[test,], type="class")
+(cm <- table(pred, d$deceptive[test]))
+
+```
+
+
+```{r}
+# tuning svm
+system.time(fit <- tune(svm, train.x=dfm[train,], 
+            train.y=factor(d$deceptive[train]),
+            kernel="linear",
+            ranges=list(cost=c(0.001, 0.01, 0.1, 1, 5, 10, 100))))
+
+summary(fit)
+
+bestmodel <- fit$best.model
+summary(bestmodel)
+
+preds <- predict(bestmodel, dfm[test,])
+
+#confusion matrix
+(cm <- table(preds, d$deceptive[test]))
+```
+
+```{r}
+# random forests
+rfdfm <- dfm_trim(dfm, min_docfreq = 5, max_docfreq = 0.9*nrow(dfm), verbose=TRUE)
+X <- as.matrix(rfdfm)
+dim(X)
+system.time(rf <- randomForest(x=X[train,], y=factor(d$class[train]),
+                   xtest=X[test,], ytest=factor(d$class[test]),
+                   importance=TRUE, mtry=20, ntree=100, keep.forest=TRUE))
+
+rf # view test and OOB errors 
+x <- c(136, 27, 24, 133)  #input confusion matrix values (use test confusion matrix)
+cm <- matrix(x, nrow=2, ncol=2)
+
+preds <- predict(rf, rfdfm[test,]) 
+importance(rf)
+varImpPlot(rf)
+```
+
+```{r}
+# extreme gradient boosting 
+
+# converting matrix object
+X <- as(dfm, "dgCMatrix")
+# parameters to explore
+tryEta <- c(1,2)
+tryDepths <- c(1,2,4)
+# placeholders for now
+bestEta=NA
+bestDepth=NA
+bestAcc=0
+
+for(eta in tryEta){
+  for(dp in tryDepths){ 
+    bst <- xgb.cv(data = X[train,], 
+            label =  d$class[train], 
+            max.depth = dp,
+          eta = eta, 
+          nthread = 4,
+          nround = 500,
+          nfold=5,
+          print_every_n = 100L,
+          objective = "binary:logistic")
+    # cross-validated accuracy
+    acc <- 1-mean(tail(bst$evaluation_log$test_error_mean))
+        cat("Results for eta=",eta," and depth=", dp, " : ",
+                acc," accuracy.\n",sep="")
+        if(acc>bestAcc){
+                bestEta=eta
+                bestAcc=acc
+                bestDepth=dp
+        }
+    }
+}
+
+cat("Best model has eta=",bestEta," and depth=", bestDepth, " : ",
+    bestAcc," accuracy.\n",sep="")
+
+
+# running best model
+rf <- xgboost(data = X[train,], 
+    label = d$class[train], 
+        max.depth = bestDepth,
+    eta = bestEta, 
+    nthread = 4,
+    nround = 1000,
+        print_every_n=100L,
+    objective = "binary:logistic")
+
+# out-of-sample accuracy
+preds <- predict(rf, X[test,])
+
+#confusion matrix
+(cm <- table(preds>0.5, d$class[test]))
+
+# performance
+pr <- precrecall(cm[2:1, 2:1]) # precision and recall
+round((sum(diag(cm)) / sum(cm)),2) # accuracy
+2 * prod(pr) / sum(pr) #F1 score
+roc(d$class[test], as.numeric(preds)) #AUC
+```
+
+
